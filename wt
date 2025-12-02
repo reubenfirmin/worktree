@@ -1,0 +1,540 @@
+#!/bin/bash
+# Git worktree manager - generic version
+# Project-specific bootstrapping via scripts/wt_bootstrap.sh
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# Colors
+G='\033[0;32m'; B='\033[0;34m'; Y='\033[1;33m'; R='\033[0;31m'; N='\033[0m'
+
+# Find repo root from current directory (returns main repo, not worktree)
+find_repo_root() {
+    local dir="$PWD"
+    while [ "$dir" != "/" ]; do
+        if [ -d "$dir/.git" ]; then
+            # This is the main repo
+            echo "$dir"
+            return 0
+        elif [ -f "$dir/.git" ]; then
+            # This is a worktree - .git file contains path to main repo
+            # Format: "gitdir: /path/to/main/.git/worktrees/name"
+            local gitdir=$(cat "$dir/.git" | sed 's/gitdir: //')
+            # Go up from .git/worktrees/name to get .git, then get its parent
+            local main_git=$(cd "$gitdir/../.." && pwd -P)
+            local main_repo=$(dirname "$main_git")
+            echo "$main_repo"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+require_repo() {
+    REPO_ROOT="$(find_repo_root)" || { echo -e "${R}Error: Not in a git repository${N}"; exit 1; }
+    REPO_NAME=$(basename "$REPO_ROOT")
+}
+
+install_wt() {
+    local shell_name=$(basename "$SHELL")
+    local config_file=""
+    local source_line=""
+    local search_pattern=""
+
+    case "$shell_name" in
+        bash)
+            config_file="$HOME/.bashrc"
+            source_line="source $SCRIPT_DIR/wt.bash"
+            search_pattern="wt.bash"
+            ;;
+        zsh)
+            config_file="$HOME/.zshrc"
+            source_line="source $SCRIPT_DIR/wt.zsh"
+            search_pattern="wt.zsh"
+            ;;
+        fish)
+            config_file="$HOME/.config/fish/config.fish"
+            source_line="source $SCRIPT_DIR/wt.fish"
+            search_pattern="wt.fish"
+            ;;
+        *)
+            echo -e "${R}Unsupported shell: $shell_name${N}"
+            echo "Supported: bash, zsh, fish"
+            exit 1
+            ;;
+    esac
+
+    # Check if already installed
+    if [ -f "$config_file" ] && grep -q "$search_pattern" "$config_file"; then
+        # Check if it's pointing to the same location
+        if grep -q "$source_line" "$config_file"; then
+            echo -e "${Y}Already installed in $config_file${N}"
+            echo
+            echo -e "${B}To use now:${N}"
+            echo "  source $config_file"
+            exit 0
+        else
+            # Update to new location
+            echo -e "${B}→${N} Updating wt function in $config_file"
+            sed -i "s|.*$search_pattern.*|$source_line|" "$config_file"
+        fi
+    else
+        # Add to config file
+        echo -e "${B}→${N} Installing wt function to $config_file"
+        echo "" >> "$config_file"
+        echo "# Git worktree manager" >> "$config_file"
+        echo "$source_line" >> "$config_file"
+    fi
+
+    echo -e "${G}✓${N} Installed!"
+    echo
+    echo -e "${B}To use now:${N}"
+    echo "  source $config_file"
+    echo
+    echo -e "${B}Then:${N}"
+    echo "  wt -c my-branch"
+}
+
+usage() {
+    echo -e "${B}wt - Git Worktree Manager${N}"
+    echo
+    echo -e "${G}Usage:${N}"
+    echo "  wt -c|--create <branch> [base]    Create worktree"
+    echo "  wt --rm <branch>                  Remove worktree"
+    echo "  wt --nuke                         Remove CURRENT worktree & return to main"
+    echo "  wt --clean                        Cleanup worktrees"
+    echo "  wt --ls                           List worktrees"
+    echo "  wt --install                      Install shell function"
+    echo
+    echo -e "${G}Flags:${N}"
+    echo "  --skip-bootstrap          Skip running scripts/wt_bootstrap.sh"
+    echo
+    echo -e "${G}Examples:${N}"
+    echo "  wt -c feature-123                 # Create from current branch"
+    echo "  wt --create feature-123 main      # Create from main"
+    echo "  wt -c feature-123 --skip-bootstrap  # Create without bootstrap"
+    echo "  wt --rm feature-123               # Remove worktree"
+    echo "  wt --nuke                         # Remove current worktree (when inside one)"
+    echo "  wt --clean                        # Cleanup all"
+    echo
+    echo -e "${G}Project Bootstrap:${N}"
+    echo "  If scripts/wt_bootstrap.sh exists in your project, it will be"
+    echo "  executed after worktree creation. Use this for npm ci, doppler, etc."
+}
+
+sanitize_name() {
+    echo "$1" | sed 's/[^a-zA-Z0-9-]/-/g' | tr '[:upper:]' '[:lower:]'
+}
+
+get_worktree_path() {
+    local name=$(sanitize_name "$1")
+    echo "$(dirname "$REPO_ROOT")/${REPO_NAME}-${name}"
+}
+
+create_worktree() {
+    local branch=$1
+    local base=${2:-$(git branch --show-current)}
+    local skip_bootstrap=false
+
+    shift 2 2>/dev/null || shift 1
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --skip-bootstrap) skip_bootstrap=true; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    local wt_path=$(get_worktree_path "$branch")
+
+    # Check if worktree already exists
+    if git worktree list | grep -q "$wt_path"; then
+        echo -e "${G}✓${N} Worktree already exists at: ${wt_path}"
+        echo "$wt_path" > /tmp/wt-last-path
+        echo -e "${G}Run:${N} cd $wt_path"
+        return 0
+    fi
+
+    echo -e "${B}→${N} Creating ${branch} at ${wt_path}"
+
+    # If directory exists, check if it's safe to clean up
+    if [ -d "$wt_path" ]; then
+        local contents=$(ls -A "$wt_path" 2>/dev/null)
+
+        if [ -z "$contents" ]; then
+            echo -e "${Y}→${N} Removing empty directory leftover from failed cleanup"
+            rmdir "$wt_path"
+        else
+            # Check if all contents are gitignored
+            local has_non_ignored=false
+            while IFS= read -r item; do
+                if ! git check-ignore -q "$item" 2>/dev/null; then
+                    has_non_ignored=true
+                    break
+                fi
+            done <<< "$contents"
+
+            if [ "$has_non_ignored" = false ]; then
+                echo -e "${Y}→${N} Removing directory with only gitignored files"
+                rm -rf "$wt_path"
+            else
+                echo -e "${R}Error: Directory exists with non-ignored content: $wt_path${N}"
+                exit 1
+            fi
+        fi
+    fi
+
+    if git show-ref --verify --quiet "refs/heads/$branch"; then
+        git worktree add "$wt_path" "$branch"
+    elif git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+        git worktree add "$wt_path" "$branch"
+    else
+        git worktree add -b "$branch" "$wt_path" "$base"
+    fi
+
+    cd "$wt_path"
+
+    # Run project-specific bootstrap if it exists
+    if [ "$skip_bootstrap" = false ]; then
+        local bootstrap_script="$wt_path/scripts/wt_bootstrap.sh"
+        if [ -f "$bootstrap_script" ]; then
+            echo -e "${B}→${N} Running project bootstrap: scripts/wt_bootstrap.sh"
+            chmod +x "$bootstrap_script"
+            "$bootstrap_script" "$REPO_ROOT" "$wt_path"
+        else
+            echo -e "${Y}→${N} No scripts/wt_bootstrap.sh found, skipping project-specific setup"
+        fi
+    else
+        echo -e "${Y}→${N} Skipping bootstrap (--skip-bootstrap)"
+    fi
+
+    echo -e "${G}✓${N} Created at: ${wt_path}"
+    echo
+    echo -e "${B}You are in a worktree${N}"
+    echo -e "  This is a separate checkout that can be developed independently."
+    echo -e "  Multiple worktrees can run in parallel."
+    echo
+    echo -e "${G}Run:${N} cd $wt_path"
+    echo
+
+    # Store path for shell function wrapper
+    echo "$wt_path" > /tmp/wt-last-path
+}
+
+remove_worktree() {
+    local name=$1
+    if [ -z "$name" ]; then
+        echo -e "${R}Error: Branch name required${N}"
+        git worktree list
+        exit 1
+    fi
+
+    local wt_path=$(get_worktree_path "$name")
+
+    if ! git worktree list | grep -q "$wt_path"; then
+        wt_path="$(dirname "$REPO_ROOT")/${name}"
+        if ! git worktree list | grep -q "$wt_path"; then
+            echo -e "${R}Error: Worktree not found${N}"
+            git worktree list
+            exit 1
+        fi
+    fi
+
+    read -p "Remove $wt_path? (y/N) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    git worktree remove "$wt_path" 2>/dev/null || {
+        rm -rf "$wt_path"
+        git worktree prune
+    }
+
+    echo -e "${G}✓${N} Removed"
+}
+
+cleanup_worktrees() {
+    echo -e "${B}→${N} Finding worktrees to clean..."
+
+    local cleaned=0
+    local candidates=()
+    local path="" branch=""
+
+    # Determine the main branch for merge checking
+    local main_branch="main"
+    if git show-ref --verify --quiet "refs/remotes/origin/develop"; then
+        main_branch="origin/develop"
+    elif git show-ref --verify --quiet "refs/remotes/origin/main"; then
+        main_branch="origin/main"
+    elif git show-ref --verify --quiet "refs/remotes/origin/master"; then
+        main_branch="origin/master"
+    fi
+
+    # Parse porcelain output properly
+    while IFS= read -r line; do
+        if [[ $line =~ ^worktree\ (.+)$ ]]; then
+            path="${BASH_REMATCH[1]}"
+            branch=""
+        elif [[ $line =~ ^branch\ refs/heads/(.+)$ ]]; then
+            branch="${BASH_REMATCH[1]}"
+
+            # Skip main worktree - compare absolute paths
+            local abs_path="$(cd "$path" 2>/dev/null && pwd -P || echo "$path")"
+            if [ "$abs_path" = "$REPO_ROOT" ]; then
+                continue
+            fi
+
+            # Extra safety: skip if path doesn't contain the repo name pattern
+            if [[ ! "$path" =~ -${REPO_NAME}- ]] && [[ ! "$path" =~ /${REPO_NAME}- ]]; then
+                continue
+            fi
+
+            # Determine status - check if merged to main branch
+            local status="unmerged"
+            if git merge-base --is-ancestor "$branch" "$main_branch" 2>/dev/null; then
+                status="merged"
+            fi
+
+            candidates+=("$path|$branch|$status")
+        fi
+    done < <(git worktree list --porcelain)
+
+    if [ ${#candidates[@]} -eq 0 ]; then
+        echo -e "${G}✓${N} No worktrees to clean"
+        return
+    fi
+
+    echo -e "Found ${#candidates[@]} worktree(s):"
+    echo
+
+    for candidate in "${candidates[@]}"; do
+        IFS='|' read -r path branch status <<< "$candidate"
+
+        echo -e "${Y}Branch:${N} $branch ($status)"
+        echo -e "${Y}Path:${N} $path"
+
+        # Check for uncommitted changes
+        local has_changes=false
+        if [ -d "$path" ]; then
+            local status_output=$(cd "$path" && git status --short 2>/dev/null)
+
+            if [ -n "$status_output" ]; then
+                has_changes=true
+                echo
+                echo -e "${R}*** WARNING: UNCOMMITTED CHANGES ***${N}"
+                echo -e "${R}Uncommitted files will be PERMANENTLY LOST if deleted!${N}"
+                echo
+                echo -e "${Y}Changed files:${N}"
+                echo "$status_output" | head -10
+                if [ $(echo "$status_output" | wc -l) -gt 10 ]; then
+                    echo "... and more"
+                fi
+                echo
+            fi
+        fi
+
+        if ! read -p "Delete? (y/N) " -n 1 -r; then
+            echo
+            echo -e "${Y}Skipped (read interrupted)${N}"
+            echo
+            continue
+        fi
+        echo
+
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            if [ "$has_changes" = true ]; then
+                echo
+                echo -e "${R}*** FINAL WARNING ***${N}"
+                echo -e "${R}Branch '$branch' has uncommitted changes that will be LOST FOREVER!${N}"
+                echo
+                if ! read -p "Type the branch name '$branch' to confirm deletion: " -r; then
+                    echo
+                    echo -e "${Y}Cancelled (read interrupted)${N}"
+                    echo
+                    continue
+                fi
+                if [ "$REPLY" != "$branch" ]; then
+                    echo "Cancelled - input did not match"
+                    echo
+                    continue
+                fi
+            fi
+
+            git worktree remove "$path" 2>/dev/null || {
+                rm -rf "$path"
+                git worktree prune
+            }
+            echo -e "${G}✓${N} Removed"
+            cleaned=$((cleaned + 1))
+        else
+            echo "Skipped"
+        fi
+        echo
+    done
+
+    if [ $cleaned -eq 0 ]; then
+        echo -e "${Y}No worktrees removed${N}"
+    else
+        echo -e "${G}✓${N} Cleaned $cleaned worktree(s)"
+    fi
+}
+
+nuke_current_worktree() {
+    local current_dir="$(pwd)"
+    local current_abs="$(cd "$current_dir" && pwd -P)"
+
+    # Check if we're in the main repo
+    if [ "$current_abs" = "$REPO_ROOT" ]; then
+        echo -e "${R}Error: You are in the main repository${N}"
+        echo -e "${Y}The --nuke option is only for removing the current worktree${N}"
+        echo -e "${Y}Use 'wt --clean' or 'wt --rm <branch>' instead${N}"
+        exit 1
+    fi
+
+    # Check if current directory is a worktree
+    local is_worktree=false
+    local wt_branch=""
+    local wt_path=""
+
+    while IFS= read -r line; do
+        if [[ $line =~ ^worktree\ (.+)$ ]]; then
+            wt_path="${BASH_REMATCH[1]}"
+        elif [[ $line =~ ^branch\ refs/heads/(.+)$ ]]; then
+            wt_branch="${BASH_REMATCH[1]}"
+            local abs_path="$(cd "$wt_path" 2>/dev/null && pwd -P || echo "$wt_path")"
+            if [ "$abs_path" = "$current_abs" ]; then
+                is_worktree=true
+                break
+            fi
+        fi
+    done < <(git worktree list --porcelain)
+
+    if [ "$is_worktree" = false ]; then
+        echo -e "${R}Error: Current directory is not a git worktree${N}"
+        echo -e "${Y}Current: $current_abs${N}"
+        exit 1
+    fi
+
+    echo -e "${Y}Worktree:${N} $wt_branch"
+    echo -e "${Y}Path:${N} $current_abs"
+    echo
+
+    # Check for uncommitted changes
+    local has_changes=false
+    local status_output=$(git status --short 2>/dev/null)
+
+    if [ -n "$status_output" ]; then
+        has_changes=true
+        echo -e "${R}*** WARNING: UNCOMMITTED CHANGES ***${N}"
+        echo -e "${R}Uncommitted files will be PERMANENTLY LOST if deleted!${N}"
+        echo
+        echo -e "${Y}Changed files:${N}"
+        echo "$status_output" | head -10
+        if [ $(echo "$status_output" | wc -l) -gt 10 ]; then
+            echo "... and more"
+        fi
+        echo
+    fi
+
+    if ! read -p "Delete this worktree? (y/N) " -n 1 -r; then
+        echo
+        echo -e "${Y}Cancelled${N}"
+        exit 1
+    fi
+    echo
+
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Cancelled"
+        exit 0
+    fi
+
+    if [ "$has_changes" = true ]; then
+        echo
+        echo -e "${R}*** FINAL WARNING ***${N}"
+        echo -e "${R}Branch '$wt_branch' has uncommitted changes that will be LOST FOREVER!${N}"
+        echo
+        if ! read -p "Type the branch name '$wt_branch' to confirm deletion: " -r; then
+            echo
+            echo -e "${Y}Cancelled${N}"
+            exit 1
+        fi
+        if [ "$REPLY" != "$wt_branch" ]; then
+            echo "Cancelled - input did not match"
+            exit 1
+        fi
+    fi
+
+    # Write the main repo path to temp file so shell function can cd
+    echo "$REPO_ROOT" > /tmp/wt-nuke-path
+
+    # Change to main repo BEFORE removing the worktree
+    echo
+    echo -e "${B}→${N} Returning to main repository: $REPO_ROOT"
+    cd "$REPO_ROOT"
+
+    echo -e "${B}→${N} Removing worktree..."
+
+    git worktree remove --force "$current_abs" 2>/dev/null || {
+        rm -rf "$current_abs"
+        git worktree prune
+    }
+
+    echo -e "${G}✓${N} Worktree removed"
+}
+
+# Main
+case "${1:-}" in
+    --install)
+        install_wt
+        ;;
+    -c|--create)
+        require_repo
+        [ -z "${2:-}" ] && { echo -e "${R}Branch required${N}"; exit 1; }
+        shift
+        create_worktree "$@"
+        ;;
+    --rm|--remove)
+        require_repo
+        remove_worktree "$2"
+        ;;
+    --nuke)
+        require_repo
+        nuke_current_worktree
+        ;;
+    --clean|--cleanup)
+        require_repo
+        cleanup_worktrees
+        ;;
+    --ls|--list)
+        require_repo
+        git worktree list
+        ;;
+    -h|--help)
+        usage
+        ;;
+    "")
+        echo -e "${Y}wt must be installed as a shell function to auto-cd into worktrees${N}"
+        echo
+        echo -e "${B}Install:${N}"
+        echo "  $SCRIPT_DIR/wt --install"
+        echo
+        echo -e "${B}Then restart your shell or:${N}"
+        echo "  source ~/.bashrc   # or ~/.zshrc or ~/.config/fish/config.fish"
+        echo
+        echo -e "${B}Usage after install:${N}"
+        echo "  wt -c my-branch          # Create worktree (auto-cd)"
+        echo "  wt --rm my-branch        # Remove worktree"
+        echo "  wt --nuke                # Remove current worktree"
+        echo "  wt --clean               # Cleanup worktrees"
+        echo "  wt --ls                  # List worktrees"
+        exit 1
+        ;;
+    *)
+        echo -e "${R}Unknown command: $1${N}"
+        usage
+        exit 1
+        ;;
+esac
