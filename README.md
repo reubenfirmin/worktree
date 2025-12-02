@@ -11,7 +11,7 @@ Git worktree manager. Simplifies creating, switching between, and cleaning up wo
 This adds a shell function to your config file (`~/.bashrc`, `~/.zshrc`, or `~/.config/fish/config.fish`). Reload your shell:
 
 ```bash
-source ~/.bashrc  # or ~/.zshrc
+source ~/.bashrc  # or ~/.zshrc or: source ~/.config/fish/config.fish
 ```
 
 ## Usage
