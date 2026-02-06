@@ -119,13 +119,24 @@ usage() {
     echo "  wt --nuke                         # Remove current worktree (when inside one)"
     echo "  wt --clean                        # Cleanup all"
     echo
-    echo -e "${G}Project Bootstrap:${N}"
-    echo "  If scripts/wt_bootstrap.sh exists in your project, it will be"
-    echo "  executed after worktree creation. Use this for npm ci, doppler, etc."
+    echo -e "${G}Project Hooks:${N}"
+    echo "  If scripts/wt_bootstrap.sh exists, it runs after worktree creation."
+    echo "  If scripts/wt_teardown.sh exists, it runs before worktree removal."
+    echo "  Both receive args: \$1=REPO_ROOT \$2=WORKTREE_PATH"
 }
 
 sanitize_name() {
     echo "$1" | sed 's/[^a-zA-Z0-9-]/-/g' | tr '[:upper:]' '[:lower:]'
+}
+
+run_teardown() {
+    local wt_path="$1"
+    local teardown_script="$wt_path/scripts/wt_teardown.sh"
+    if [ -f "$teardown_script" ]; then
+        echo -e "${B}→${N} Running project teardown: scripts/wt_teardown.sh"
+        chmod +x "$teardown_script"
+        "$teardown_script" "$REPO_ROOT" "$wt_path"
+    fi
 }
 
 get_worktree_path() {
@@ -186,6 +197,8 @@ create_worktree() {
     fi
 
     if git show-ref --verify --quiet "refs/heads/$branch"; then
+        # Branch exists - update it to base before creating worktree
+        git branch -f "$branch" "$base"
         git worktree add "$wt_path" "$branch"
     elif git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
         git worktree add "$wt_path" "$branch"
@@ -230,15 +243,28 @@ remove_worktree() {
         exit 1
     fi
 
-    local wt_path=$(get_worktree_path "$name")
+    # Find worktree by branch name from git's list (handles symlink mismatches)
+    local wt_path=""
+    local sanitized=$(sanitize_name "$name")
 
-    if ! git worktree list | grep -q "$wt_path"; then
-        wt_path="$(dirname "$REPO_ROOT")/${name}"
-        if ! git worktree list | grep -q "$wt_path"; then
-            echo -e "${R}Error: Worktree not found${N}"
-            git worktree list
-            exit 1
-        fi
+    # Try to find by branch name first
+    wt_path=$(git worktree list --porcelain | awk -v branch="$name" '
+        /^worktree / { path = substr($0, 10) }
+        /^branch refs\/heads\// {
+            b = substr($0, 20)
+            if (b == branch) { print path; exit }
+        }
+    ')
+
+    # If not found by branch, try by path pattern
+    if [ -z "$wt_path" ]; then
+        wt_path=$(git worktree list | grep -E "[-/]${sanitized}\s" | awk '{print $1}')
+    fi
+
+    if [ -z "$wt_path" ]; then
+        echo -e "${R}Error: Worktree not found${N}"
+        git worktree list
+        exit 1
     fi
 
     read -p "Remove $wt_path? (y/N) " -n 1 -r
@@ -247,6 +273,8 @@ remove_worktree() {
         echo "Cancelled"
         exit 0
     fi
+
+    run_teardown "$wt_path"
 
     git worktree remove "$wt_path" 2>/dev/null || {
         rm -rf "$wt_path"
@@ -363,6 +391,8 @@ cleanup_worktrees() {
                 fi
             fi
 
+            run_teardown "$path"
+
             git worktree remove "$path" 2>/dev/null || {
                 rm -rf "$path"
                 git worktree prune
@@ -466,6 +496,8 @@ nuke_current_worktree() {
             exit 1
         fi
     fi
+
+    run_teardown "$current_abs"
 
     # Write the main repo path to temp file so shell function can cd
     echo "$REPO_ROOT" > /tmp/wt-nuke-path
