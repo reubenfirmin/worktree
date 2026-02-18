@@ -203,8 +203,13 @@ create_worktree() {
     fi
 
     if git show-ref --verify --quiet "refs/heads/$branch"; then
-        # Branch exists - update it to base before creating worktree
-        git branch -f "$branch" "$base"
+        if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+            # Branch exists locally and remotely - update to remote
+            git branch -f "$branch" "origin/$branch"
+        else
+            # Branch exists locally only - reset to base
+            git branch -f "$branch" "$base"
+        fi
         git worktree add "$wt_path" "$branch"
     elif git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
         git worktree add "$wt_path" "$branch"
