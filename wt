@@ -196,6 +196,12 @@ create_worktree() {
         fi
     fi
 
+    # Fetch the branch from remote if it exists (so we don't use stale refs)
+    if git ls-remote --heads origin "$branch" 2>/dev/null | grep -q .; then
+        echo -e "${B}→${N} Fetching origin/$branch"
+        git fetch origin "$branch"
+    fi
+
     if git show-ref --verify --quiet "refs/heads/$branch"; then
         # Branch exists - update it to base before creating worktree
         git branch -f "$branch" "$base"
